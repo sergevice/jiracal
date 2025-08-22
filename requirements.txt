@@ -1,0 +1,5 @@
+streamlit>=1.33,<2
+streamlit-calendar==1.4.0
+requests==2.32.3
+python-dateutil==2.9.0.post0
+pytz==2024.1
