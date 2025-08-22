@@ -311,8 +311,8 @@ cal_state = calendar(
 jc = JiraClient(jira_base, jira_email, jira_token)
 
 # 1) Подвійний клік → створення worklog
+# Фолбек "подвійного кліку": два швидкі dateClick по тій самій клітинці
 if cal_state and isinstance(cal_state, dict):
-    # Подвійний клік фолбеком: два швидкі dateClick по тій самій клітинці
     date_click = cal_state.get("dateClick")
     if date_click and "date" in date_click:
         last = st.session_state.get("_last_click_ts")
@@ -322,7 +322,8 @@ if cal_state and isinstance(cal_state, dict):
         if last and last_cell == this_cell and (this_ts - last) < 0.4:
             click_dt = parse_iso(this_cell)
             click_dt = round_to_5min(click_dt)
-            open_create_dialog(click_dt.astimezone(pytz.UTC).isoformat())
+            st.session_state["create_dialog_open"] = True
+            st.session_state["create_dialog_start"] = click_dt.astimezone(pytz.UTC).isoformat()
         st.session_state["_last_click_ts"] = this_ts
         st.session_state["_last_click_cell"] = this_cell
 
@@ -357,68 +358,99 @@ if cal_state and isinstance(cal_state, dict):
                 st.error(f"Помилка оновлення worklog: {e}")
 
 # ----------------------------
-# Діалог створення нового worklog
+# Діалог створення нового worklog (форма зі вводом)
 # ----------------------------
-if st.session_state["create_dialog_open"]:
+if st.session_state.get("create_dialog_open"):
     st.markdown("### ➕ Новий worklog")
-    start_iso = st.session_state["create_dialog_start"]
-    start_dt_local = parse_iso(start_iso).astimezone(tz)
-    col1, col2, col3 = st.columns([2, 1, 1])
 
-    with col1:
+    # Час початку з клікнутого слоту
+    start_iso = st.session_state.get("create_dialog_start")
+    start_dt_local = parse_iso(start_iso).astimezone(tz)
+
+    with st.form("create_worklog_form", clear_on_submit=False):
         st.write(f"Початок: **{start_dt_local.strftime('%Y-%m-%d %H:%M')} ({tz_name})**")
-        # Можна дозволити підредагувати:
-        manual_start = st.checkbox("Змінити час початку вручну", value=False)
+
+        manual_start = st.checkbox("Змінити час початку вручну", value=False, key="create_manual_start")
         if manual_start:
-            new_date = st.date_input("Дата", value=start_dt_local.date())
-            new_time = st.time_input("Час", value=start_dt_local.time())
+            new_date = st.date_input("Дата", value=start_dt_local.date(), key="create_date")
+            new_time = st.time_input("Час", value=start_dt_local.time(), key="create_time")
+            # локалізуємо + переобчислюємо ISO в UTC
             start_dt_local = tz.localize(datetime.combine(new_date, new_time))
             start_iso = start_dt_local.astimezone(pytz.UTC).isoformat()
 
-    # Пошук задач, призначених користувачу
-    with st.spinner("Шукаю задачі, призначені користувачу…"):
+        # 1) Підтягнемо задачі, призначені вибраному користувачу (selected_account_id)
+        issues_resp = {}
+        issue_options = []
+        key_to_summary = {}
+
         try:
-            issues_resp = cached_issues_for_assignee(jira_base, jira_email, jira_token, selected_account_id)
-            issue_options = []
-            key_to_summary = {}
+            issues_resp = cached_issues_for_assignee(
+                jira_base, jira_email, jira_token, selected_account_id
+            )
             for it in issues_resp.get("issues", []):
                 key = it["key"]
                 summary = it["fields"].get("summary", key)
-                option = f"{key} · {summary}"
-                issue_options.append(option)
+                label = f"{key} · {summary[:80]}"
+                issue_options.append(label)
                 key_to_summary[key] = summary
         except Exception as e:
-            st.error(f"Помилка пошуку задач: {e}")
-            issue_options = []
-            key_to_summary = {}
+            st.warning(f"Не вдалося отримати список задач: {e}")
 
-    with col2:
-        sel_issue_label = st.selectbox("Issue", options=issue_options)
-        sel_issue_key = sel_issue_label.split(" · ")[0] if " · " in sel_issue_label else sel_issue_label
+        # 2) Якщо список пустий — дамо поле ручного вводу ключа
+        use_manual_issue = False
+        selected_issue_key = None
 
-    with col3:
-        hours = st.number_input("Години", min_value=0, step=1, value=1)
-        minutes = st.number_input("Хвилини", min_value=0, max_value=55, step=5, value=0)
+        if issue_options:
+            sel = st.selectbox("Задача", options=issue_options, key="create_issue_select")
+            selected_issue_key = sel.split(" · ")[0] if " · " in sel else sel
+        else:
+            use_manual_issue = True
+            selected_issue_key = st.text_input("Ключ задачі (наприклад, ABC-123)", value="", key="create_issue_manual")
 
-    comment = st.text_input("Коментар (необов’язково)", value="")
+        # 3) Тривалість та коментар
+        col_h, col_m = st.columns(2)
+        with col_h:
+            hours = st.number_input("Години", min_value=0, step=1, value=1, key="create_hours")
+        with col_m:
+            minutes = st.number_input("Хвилини", min_value=0, max_value=55, step=5, value=0, key="create_minutes")
 
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("Створити worklog", type="primary", use_container_width=True):
+        comment = st.text_input("Коментар (необов’язково)", value="", key="create_comment")
+
+        c1, c2 = st.columns([1,1])
+        submit = c1.form_submit_button("Створити worklog", type="primary", use_container_width=True)
+        cancel = c2.form_submit_button("Скасувати", use_container_width=True)
+
+        if cancel:
+            st.session_state["create_dialog_open"] = False
+            st.session_state["create_dialog_start"] = None
+            st.experimental_rerun()
+
+        if submit:
+            if not selected_issue_key:
+                st.error("Вкажи ключ задачі або обери з переліку.")
+                st.stop()
+
             secs = int(hours) * 3600 + int(minutes) * 60
             secs = max(secs, 60)  # мінімум 1 хв
+
             try:
-                jc.add_worklog(sel_issue_key, started_iso=start_iso, time_spent_seconds=secs, comment=comment)
-                st.success(f"Створено worklog {sel_issue_key}: {start_dt_local.strftime('%Y-%m-%d %H:%M')} / {human_duration(secs)}")
-                close_create_dialog()
+                jc.add_worklog(
+                    selected_issue_key,
+                    started_iso=start_iso,
+                    time_spent_seconds=secs,
+                    comment=comment
+                )
+                st.success(
+                    f"Створено worklog для {selected_issue_key}: "
+                    f"{start_dt_local.strftime('%Y-%m-%d %H:%M')} / {human_duration(secs)}"
+                )
+                # закриваємо форму, очищаємо кеш і перерендеримо
+                st.session_state["create_dialog_open"] = False
+                st.session_state["create_dialog_start"] = None
                 cached_worklogs_week.clear()
                 st.rerun()
             except Exception as e:
                 st.error(f"Не вдалось створити worklog: {e}")
-    with c2:
-        if st.button("Скасувати", use_container_width=True):
-            close_create_dialog()
-            st.experimental_rerun()
 
 # ----------------------------
 # Дрібні підказки
