@@ -9,37 +9,29 @@ from datetime import datetime, timedelta
 from dateutil import parser as dtparser
 from streamlit_calendar import calendar
 
-# --- Secrets / env ---
-def _get_secret(section: str, key: str, env: str, default: str = ""):
-    try:
-        return st.secrets[section][key]
-    except Exception:
-        return os.getenv(env, default)
-
-JIRA_BASE_URL   = _get_secret("jira", "base_url",   "JIRA_BASE_URL",   "https://your-domain.atlassian.net")
-JIRA_EMAIL      = _get_secret("jira", "email",      "JIRA_EMAIL",      "")
-JIRA_API_TOKEN  = _get_secret("jira", "api_token",  "JIRA_API_TOKEN",  "")
-
+# ----------------------------
+# Конфіг
+# ----------------------------
 st.set_page_config(page_title="Jira Worklog Weekly Calendar", layout="wide")
 
-# --- Sidebar: prefer secrets; allow override only if empty ---
-with st.sidebar:
-    st.header("Jira")
+def get_secret(section: str, key: str, env: str = None, default: str = ""):
+    """Повертає значення з st.secrets[section][key] або з env, або default.
+       Якщо ключа нема — не кидає винятків.
+    """
+    try:
+        if section in st.secrets and key in st.secrets[section]:
+            return st.secrets[section][key]
+    except Exception:
+        pass
+    if env:
+        return os.getenv(env, default) or default
+    return default
 
-    jira_base = st.text_input("Jira Base URL", value=JIRA_BASE_URL, help="e.g., https://your-domain.atlassian.net")
-    jira_email = st.text_input("Email (Jira Cloud)", value=JIRA_EMAIL)
+# Значення за замовчуванням (можуть бути частково з secrets.toml)
+JIRA_BASE_URL  = get_secret("jira", "base_url",  "JIRA_BASE_URL",  "https://your-domain.atlassian.net")
+JIRA_EMAIL     = get_secret("jira", "email",     "JIRA_EMAIL",     "")
+JIRA_API_TOKEN = get_secret("jira", "api_token", "JIRA_API_TOKEN", "")
 
-    # If a token is provided via secrets, don’t prefill it; keep masked input empty.
-    token_prefilled = "jira" in st.secrets and "api_token" in st.secrets["jira"]
-    jira_token = st.text_input(
-        "API Token",
-        value="" if token_prefilled else JIRA_API_TOKEN,
-        type="password",
-        help="Set via Streamlit secrets; leave blank to use the secret."
-    )
-    if token_prefilled and not jira_token:
-        # Use secret token if field is blank
-        jira_token = st.secrets["jira"]["api_token"]
 # ----------------------------
 # Утиліти
 # ----------------------------
@@ -212,9 +204,9 @@ def cached_worklogs_week(base, email, token, account_id, start_utc_iso, end_utc_
 # ----------------------------
 with st.sidebar:
     st.header("Jira")
-    jira_base = st.text_input("Jira Base URL", value=DEFAULT_JIRA_BASE, help="Напр., https://your-domain.atlassian.net")
-    jira_email = st.text_input("Email (Jira Cloud)", value=DEFAULT_JIRA_EMAIL)
-    jira_token = st.text_input("API Token", value=DEFAULT_JIRA_API_TOKEN, type="password")
+    jira_base = st.text_input("Jira Base URL", value=JIRA_BASE_URL, help="Напр., https://your-domain.atlassian.net")
+    jira_email = st.text_input("Email (Jira Cloud)", value=JIRA_EMAIL)
+    jira_token = st.text_input("API Token", value=JIRA_API_TOKEN, type="password")
 
     st.markdown("---")
     st.caption("Кого показувати на календарі?")
@@ -318,6 +310,7 @@ cal_state = calendar(
 # ----------------------------
 jc = JiraClient(jira_base, jira_email, jira_token)
 
+# 1) Подвійний клік → створення worklog
 if cal_state and isinstance(cal_state, dict):
     # Подвійний клік фолбеком: два швидкі dateClick по тій самій клітинці
     date_click = cal_state.get("dateClick")
