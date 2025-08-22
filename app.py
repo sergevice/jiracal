@@ -365,26 +365,36 @@ with st.sidebar:
     )
     tz = pytz.timezone(tz_name)
 
+    # ----- видимий діапазон календаря (за замовчуванням — поточний тиждень) -----
+    if "visible_start" not in st.session_state or "visible_end" not in st.session_state:
+        now_local = datetime.now(tz)
+        start_of_week = (now_local - timedelta(days=now_local.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        end_of_week = start_of_week + timedelta(days=7)
+        st.session_state["visible_start"] = start_of_week.astimezone(pytz.UTC).isoformat()
+        st.session_state["visible_end"] = end_of_week.astimezone(pytz.UTC).isoformat()
+
+
+
 # ----------------------------
 # Центральна частина
 # ----------------------------
 st.title("Jira Worklog — Weekly Calendar")
 
-# Межі тижня (понеділок-неділя) в обраній TZ
-now_local = datetime.now(tz)
-start_of_week = (now_local - timedelta(days=now_local.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-end_of_week = start_of_week + timedelta(days=7)
-start_of_week_utc = start_of_week.astimezone(pytz.UTC).isoformat()
-end_of_week_utc = end_of_week.astimezone(pytz.UTC).isoformat()
+# Використовуємо поточний видимий діапазон (який зберігаємо у session_state)
+visible_start_iso = st.session_state["visible_start"]   # UTC ISO
+visible_end_iso   = st.session_state["visible_end"]     # UTC ISO
 
-# Завантажуємо події, якщо є креденшли і вибраний користувач
+# ключ, що міняється на кожний видимий тиждень → форсує перемонтування календаря
+week_key = parse_iso(visible_start_iso).strftime("%Y-%W")  # рік-номер_тижня
+cal_key = f"calendar_{week_key}"
+
 events = []
 if jira_base and jira_email and jira_token and selected_account_id:
     with st.spinner("Завантажую worklog’и…"):
         try:
             events = cached_worklogs_week(
                 jira_base, jira_email, jira_token,
-                selected_account_id, start_of_week_utc, end_of_week_utc
+                selected_account_id, visible_start_iso, visible_end_iso
             )
         except Exception as e:
             st.error(f"Не вдалося завантажити worklog’и: {e}")
@@ -409,6 +419,7 @@ if st.session_state.get("draft"):
 # ----------------------------
 cal_options = {
     "initialView": "timeGridWeek",
+    "initialDate": st.session_state["visible_start"],
     "slotMinTime": "06:00:00",
     "slotMaxTime": "22:00:00",
     "allDaySlot": False,
@@ -420,17 +431,68 @@ cal_options = {
     "weekNumbers": True,
     "nowIndicator": True,
     "headerToolbar": {
-        "left": "prev,next today",
+        "left": "",                # ховаємо prev/next, щоб користуватись власними кнопками
         "center": "title",
         "right": "timeGridWeek,dayGridMonth"
     },
 }
 
+# ---------- Custom toolbar: навігація між тижнями ----------
+nav_col1, nav_col2, nav_col3, nav_col4 = st.columns([1,1,1,3])
+
+def _shift_visible(days: int):
+    start_dt = parse_iso(st.session_state["visible_start"])
+    end_dt   = parse_iso(st.session_state["visible_end"])
+    st.session_state["visible_start"] = (start_dt + timedelta(days=days)).astimezone(pytz.UTC).isoformat()
+    st.session_state["visible_end"]   = (end_dt   + timedelta(days=days)).astimezone(pytz.UTC).isoformat()
+    cached_worklogs_week.clear()  # кнопка вже викликала ререндер — додатковий rerun не потрібний
+
+with nav_col1:
+    if st.button("⟵ Prev", use_container_width=True, key="nav_prev"):
+        _shift_visible(-7)
+
+with nav_col2:
+    if st.button("Today", use_container_width=True, key="nav_today"):
+        now_local = datetime.now(tz)
+        start_of_week = (now_local - timedelta(days=now_local.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        end_of_week = start_of_week + timedelta(days=7)
+        st.session_state["visible_start"] = start_of_week.astimezone(pytz.UTC).isoformat()
+        st.session_state["visible_end"]   = end_of_week.astimezone(pytz.UTC).isoformat()
+        cached_worklogs_week.clear()
+
+with nav_col3:
+    if st.button("Next ⟶", use_container_width=True, key="nav_next"):
+        _shift_visible(+7)
+
+# ---- date_input з on_change без ручного rerun ----
+def _jump_to_selected_date():
+    jump_date = st.session_state.get("nav_jump_date")
+    if not jump_date:
+        return
+    # початок тижня у вибраній TZ
+    jdt_local = datetime.combine(jump_date, datetime.min.time()).replace(tzinfo=tz)
+    start_of_week = (jdt_local - timedelta(days=jdt_local.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    end_of_week = start_of_week + timedelta(days=7)
+    st.session_state["visible_start"] = start_of_week.astimezone(pytz.UTC).isoformat()
+    st.session_state["visible_end"]   = end_of_week.astimezone(pytz.UTC).isoformat()
+    cached_worklogs_week.clear()
+
+with nav_col4:
+    st.date_input(
+        "Перейти до дати",
+        value=parse_iso(st.session_state["visible_start"]).date(),
+        key="nav_jump_date",
+        on_change=_jump_to_selected_date,
+    )
+# -----------------------------------------------------------
+
 cal_state = calendar(
     events=events,
     options=cal_options,
-    key="calendar"
+    key=cal_key
 )
+
+
 
 # ----------------------------
 # Обробники подій календаря (лише робота з чернеткою)
@@ -471,28 +533,42 @@ def _update_draft_time(new_start_iso: str, new_end_iso: str):
     st.session_state["draft"]["start"] = parse_iso(new_start_iso).astimezone(pytz.UTC).isoformat()
     st.session_state["draft"]["end"]   = parse_iso(new_end_iso).astimezone(pytz.UTC).isoformat()
 
+def _debounce(event_key: str, payload: str) -> bool:
+    """
+    Повертає True, якщо payload новий; False — якщо такий самий уже обробляли.
+    Використовуємо для уникнення нескінченних перерендерів.
+    """
+    last = st.session_state.get(event_key)
+    if last == payload:
+        return False
+    st.session_state[event_key] = payload
+    return True
+
 if cal_state and isinstance(cal_state, dict):
-    # 1) Клік по порожньому місцю → створити НОВУ чернетку
+    # 1) Клік по порожньому місцю → створити чернетку (обробляємо лише новий клік)
     date_click = cal_state.get("dateClick")
     if date_click and "date" in date_click:
-        _mk_draft_from_click(date_click["date"])
-        st.rerun()
+        payload = date_click.get("date")
+        if _debounce("_deb_dateClick", payload):
+            _mk_draft_from_click(payload)
 
-    # 2) Клік по існуючому worklog → редагування як чернетка
+    # 2) Клік по існуючому worklog → редагування як чернетка (також з дебаунсом)
     ev_click = cal_state.get("eventClick")
     if ev_click and "event" in ev_click:
-        ev = ev_click["event"]
-        if not str(ev.get("id","")).startswith("__DRAFT__"):
-            _mk_draft_from_existing(ev)
-            st.rerun()
+        payload = json.dumps(ev_click.get("event", {}), sort_keys=True)
+        if _debounce("_deb_eventClick", payload):
+            ev = ev_click["event"]
+            if not str(ev.get("id","")).startswith("__DRAFT__"):
+                _mk_draft_from_existing(ev)
 
-    # 3) Drag/Resize чернетки → лише змінюємо локальний час
+    # 3) Drag/Resize чернетки → лише змінюємо локальний час (дебаунс)
     change = cal_state.get("eventChange")
     if change and "event" in change:
-        ev = change["event"]
-        if str(ev.get("id","")).startswith("__DRAFT__"):
-            _update_draft_time(ev.get("start"), ev.get("end"))
-            st.rerun()
+        payload = json.dumps(change.get("event", {}), sort_keys=True)
+        if _debounce("_deb_eventChange", payload):
+            ev = change["event"]
+            if str(ev.get("id","")).startswith("__DRAFT__"):
+                _update_draft_time(ev.get("start"), ev.get("end"))
 
 # ----------------------------
 # Редактор чернетки (Save/Cancel) — тут викликаємо Jira
