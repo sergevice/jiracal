@@ -383,6 +383,8 @@ st.title("Jira Worklog — Weekly Calendar")
 # Використовуємо поточний видимий діапазон (який зберігаємо у session_state)
 visible_start_iso = st.session_state["visible_start"]   # UTC ISO
 visible_end_iso   = st.session_state["visible_end"]     # UTC ISO
+week_key = parse_iso(visible_start_iso).strftime("%Y-%W")
+cal_key = f"calendar_{week_key}"
 
 # ключ, що міняється на кожний видимий тиждень → форсує перемонтування календаря
 week_key = parse_iso(visible_start_iso).strftime("%Y-%W")  # рік-номер_тижня
@@ -446,6 +448,7 @@ def _shift_visible(days: int):
     st.session_state["visible_start"] = (start_dt + timedelta(days=days)).astimezone(pytz.UTC).isoformat()
     st.session_state["visible_end"]   = (end_dt   + timedelta(days=days)).astimezone(pytz.UTC).isoformat()
     cached_worklogs_week.clear()  # кнопка вже викликала ререндер — додатковий rerun не потрібний
+    st.rerun()
 
 with nav_col1:
     if st.button("⟵ Prev", use_container_width=True, key="nav_prev"):
@@ -459,6 +462,7 @@ with nav_col2:
         st.session_state["visible_start"] = start_of_week.astimezone(pytz.UTC).isoformat()
         st.session_state["visible_end"]   = end_of_week.astimezone(pytz.UTC).isoformat()
         cached_worklogs_week.clear()
+        st.rerun()
 
 with nav_col3:
     if st.button("Next ⟶", use_container_width=True, key="nav_next"):
