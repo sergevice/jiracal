@@ -165,7 +165,6 @@ class JiraClient:
             r.raise_for_status()
             return r.json()
         except requests.HTTPError as e:
-            # Покажи діагностику з тіла відповіді
             detail = ""
             try:
                 detail = f" | details: {r.text[:500]}"
@@ -199,9 +198,43 @@ class JiraClient:
                 pass
             raise requests.HTTPError(f"{e} {detail}") from e
 
+    def list_fields(self):
+        """Повертає список усіх полів (для пошуку Epic Link)."""
+        r = self.session.get(f"{self.base}/rest/api/3/field", timeout=30)
+        r.raise_for_status()
+        return r.json()
+
+    def epic_link_jql_name(self):
+        """
+        Знаходимо, як звертатися до Epic Link у JQL.
+        Повертає 'Epic Link' або 'cf[12345]' залежно від конфігурації.
+        """
+        try:
+            fields = self.list_fields()
+            for f in fields:
+                # Cloud: epic-link має schema.custom == 'com.pyxis.greenhopper.jira:gh-epic-link'
+                schema = f.get("schema", {})
+                if schema.get("custom") == "com.pyxis.greenhopper.jira:gh-epic-link":
+                    # У JQL краще використовувати cf[ID], щоб оминути локалізацію
+                    fid = f.get("id")
+                    if fid and fid.startswith("customfield_"):
+                        num = fid.split("_", 1)[1]
+                        return f"cf[{num}]"
+                    # fallback: ім’я
+                    return f.get("name", "Epic Link")
+            # якщо не знайшли — спробуємо стандартну назву
+            return "Epic Link"
+        except Exception:
+            return "Epic Link"
+
 # ----------------------------
 # Кеші
 # ----------------------------
+@st.cache_data(show_spinner=False, ttl=3600)
+def cached_epic_link_jql_name(base, email, token):
+    jc = JiraClient(base, email, token)
+    return jc.epic_link_jql_name()
+
 @st.cache_data(show_spinner=False, ttl=300)
 def cached_users(base, email, token, query):
     jc = JiraClient(base, email, token)
@@ -264,6 +297,72 @@ def cached_worklogs_week(base, email, token, account_id, start_utc_iso, end_utc_
                 "editable": False  # існуючі події не редагуємо напряму
             })
     return events
+
+@st.cache_data(show_spinner=False, ttl=120)
+def cached_epics(base, email, token, query_text="", max_results=200):
+    """
+    Епіки (не залежить від асайнї). Якщо query_text >= 2 символи — фільтр по summary.
+    """
+    jc = JiraClient(base, email, token)
+    if query_text and len(query_text.strip()) >= 2:
+        jql = f'issuetype = Epic AND summary ~ "{query_text.strip()}*" ORDER BY updated DESC'
+    else:
+        jql = 'issuetype = Epic ORDER BY updated DESC'
+    return jc.jql_issues(jql, fields=["summary"], max_results=max_results)
+
+@st.cache_data(show_spinner=False, ttl=60)
+def cached_issues_for_epic_and_assignee(base, email, token, epic_key, account_id, max_results=200):
+    """
+    Діти конкретного епіку, призначені на account_id, нерозв’язані.
+    Підтримує 3 варіанти JQL (в залежності від типу проєкту/конфігів):
+      1) childIssuesOf("<EPIC>")
+      2) "<Epic Link поле>" = <EPIC>  (через cf[ID] або 'Epic Link')
+      3) parentEpic = <EPIC>          (team-managed)
+    Повертає результат першого вдалого запиту.
+    """
+    jc = JiraClient(base, email, token)
+
+    queries = []
+
+    # 1) childIssuesOf
+    queries.append(
+        (
+            f'issuekey in childIssuesOf("{epic_key}") AND assignee = "{account_id}" '
+            f'AND resolution = EMPTY ORDER BY updated DESC'
+        )
+    )
+
+    # 2) Epic Link через cf[id] або ім'я
+    epic_field = cached_epic_link_jql_name(base, email, token)  # напр., cf[10014] або 'Epic Link'
+    queries.append(
+        (
+            f'"{epic_field}" = {epic_key} AND assignee = "{account_id}" '
+            f'AND resolution = EMPTY ORDER BY updated DESC'
+        )
+    )
+
+    # 3) team-managed: parentEpic
+    queries.append(
+        (
+            f'parentEpic = {epic_key} AND assignee = "{account_id}" '
+            f'AND resolution = EMPTY ORDER BY updated DESC'
+        )
+    )
+
+    last_err = None
+    for jql in queries:
+        try:
+            return jc.jql_issues(jql, fields=["summary"], max_results=max_results)
+        except requests.HTTPError as e:
+            # 400/404 — пробуємо наступний варіант
+            last_err = e
+            continue
+
+    # Якщо все впало — підіймаємо найостаннішу помилку з деталями
+    if last_err:
+        raise last_err
+    # крайній захист
+    return {"issues": []}
 
 # ----------------------------
 # UI: бокова панель
@@ -373,8 +472,6 @@ with st.sidebar:
         st.session_state["visible_start"] = start_of_week.astimezone(pytz.UTC).isoformat()
         st.session_state["visible_end"] = end_of_week.astimezone(pytz.UTC).isoformat()
 
-
-
 # ----------------------------
 # Центральна частина
 # ----------------------------
@@ -383,8 +480,6 @@ st.title("Jira Worklog — Weekly Calendar")
 # Використовуємо поточний видимий діапазон (який зберігаємо у session_state)
 visible_start_iso = st.session_state["visible_start"]   # UTC ISO
 visible_end_iso   = st.session_state["visible_end"]     # UTC ISO
-week_key = parse_iso(visible_start_iso).strftime("%Y-%W")
-cal_key = f"calendar_{week_key}"
 
 # ключ, що міняється на кожний видимий тиждень → форсує перемонтування календаря
 week_key = parse_iso(visible_start_iso).strftime("%Y-%W")  # рік-номер_тижня
@@ -447,7 +542,7 @@ def _shift_visible(days: int):
     end_dt   = parse_iso(st.session_state["visible_end"])
     st.session_state["visible_start"] = (start_dt + timedelta(days=days)).astimezone(pytz.UTC).isoformat()
     st.session_state["visible_end"]   = (end_dt   + timedelta(days=days)).astimezone(pytz.UTC).isoformat()
-    cached_worklogs_week.clear()  # кнопка вже викликала ререндер — додатковий rerun не потрібний
+    cached_worklogs_week.clear()
     st.rerun()
 
 with nav_col1:
@@ -495,8 +590,6 @@ cal_state = calendar(
     options=cal_options,
     key=cal_key
 )
-
-
 
 # ----------------------------
 # Обробники подій календаря (лише робота з чернеткою)
@@ -592,6 +685,50 @@ if draft:
     if dur_secs < 60:
         dur_secs = 60
 
+    # Крок 1: вибір епіка (лише для створення)
+    if draft["mode"] == "new":
+        st.subheader("Крок 1: Обери епік")
+
+        epic_query = st.text_input(
+            "Пошук епіка (мін. 2 символи)",
+            value=st.session_state.get("draft_epic_query", ""),
+            key="draft_epic_query",
+            help="Введи частину назви епіка, або лиши порожнім, щоб побачити свіжі епіки."
+        )
+
+        epic_options, epic_key_by_label = [], {}
+        if jira_base and jira_email and jira_token:
+            try:
+                epics_resp = cached_epics(jira_base, jira_email, jira_token, epic_query)
+                for it in epics_resp.get("issues", []):
+                    ekey = it["key"]
+                    label = f"{ekey} · {it['fields'].get('summary', ekey)[:90]}"
+                    epic_options.append(label)
+                    epic_key_by_label[label] = ekey
+            except Exception as e:
+                st.warning(f"Не вдалося завантажити епіки: {e}")
+        else:
+            st.info("Вкажи Jira URL/Email/Token у лівій панелі.")
+
+        prev_label = st.session_state.get("draft_epic_label")
+        index = epic_options.index(prev_label) if prev_label in epic_options else (0 if epic_options else 0)
+        sel_label = st.selectbox(
+            "Епік",
+            options=epic_options or ["— немає збігів —"],
+            index=index,
+            key="draft_epic_select",
+        )
+
+        if epic_options:
+            st.session_state["draft_epic_key"] = epic_key_by_label.get(sel_label)
+            st.session_state["draft_epic_label"] = sel_label
+        else:
+            st.session_state["draft_epic_key"] = None
+            st.session_state["draft_epic_label"] = None
+
+        st.markdown("---")
+
+    # Крок 2: форма з вибором задачі та збереженням
     with st.form("draft_editor", clear_on_submit=False):
         st.write(f"Початок: **{start_dt_local.strftime('%Y-%m-%d %H:%M')} ({tz_name})**")
         st.write(f"Кінець: **{end_dt_local.strftime('%Y-%m-%d %H:%M')} ({tz_name})**")
@@ -600,26 +737,40 @@ if draft:
         selected_issue_key = draft.get("issueKey")
 
         if draft["mode"] == "new":
-            # список задач для вибраного користувача
-            issue_options = []
-            try:
-                if jira_base and jira_email and jira_token and selected_account_id:
-                    issues_resp = cached_issues_for_assignee(jira_base, jira_email, jira_token, selected_account_id)
-                    for it in issues_resp.get("issues", []):
-                        key = it["key"]
-                        label = f"{key} · {it['fields'].get('summary', key)[:80]}"
+            issue_options, key_by_label = [], {}
+            sel_epic_key = st.session_state.get("draft_epic_key")
+
+            if sel_epic_key and jira_base and jira_email and jira_token and selected_account_id:
+                try:
+                    resp = cached_issues_for_epic_and_assignee(
+                        jira_base, jira_email, jira_token, sel_epic_key, selected_account_id
+                    )
+                    for it in resp.get("issues", []):
+                        ikey = it["key"]
+                        label = f"{ikey} · {it['fields'].get('summary', ikey)[:90]}"
                         issue_options.append(label)
-            except Exception as e:
-                st.warning(f"Не вдалося отримати список задач: {e}")
+                        key_by_label[label] = ikey
+                except Exception as e:
+                    st.warning(f"Не вдалося отримати задачі для епіка {sel_epic_key}: {e}")
 
             if issue_options:
-                sel_label = st.selectbox("Задача", options=issue_options, key="draft_issue_select")
-                selected_issue_key = sel_label.split(" · ")[0]
+                sel_issue_label = st.selectbox(
+                    "Задача в обраному епіку (призначена на користувача)",
+                    options=issue_options,
+                    key="draft_issue_select"
+                )
+                selected_issue_key = key_by_label.get(sel_issue_label)
             else:
-                selected_issue_key = st.text_input("Ключ задачі (напр., ABC-123)", value=selected_issue_key or "", key="draft_issue_manual")
+                selected_issue_key = st.text_input(
+                    "Ключ задачі (напр., ABC-123)",
+                    value=selected_issue_key or "",
+                    key="draft_issue_manual",
+                    help="Немає задач у вибраному епіку або епік не обрано? Вкажи ключ вручну."
+                )
         else:
             st.text_input("Задача", value=draft["issueKey"], disabled=True, key="draft_issue_readonly")
 
+        # Поле коментаря (було відсутнє у твоїй вставці)
         comment = st.text_input("Коментар (необов’язково)", value=draft.get("comment",""), key="draft_comment")
 
         c1, c2 = st.columns(2)
